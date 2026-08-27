@@ -364,13 +364,15 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const id = genId();
+      const id = crypto.randomUUID();
       const path = `${library.id}/${id}.jpg`;
+      let uploaded = false;
       try {
         const { error: upErr } = await supabase.storage
           .from("photos")
           .upload(path, item.blob, { contentType: "image/jpeg", upsert: false });
         if (upErr) throw upErr;
+        uploaded = true;
         const { data: pub } = supabase.storage.from("photos").getPublicUrl(path);
         const row = {
           id,
@@ -392,6 +394,11 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       } catch (e) {
         console.error(e);
         failedCount++;
+        // The image upload can succeed even when the database row fails —
+        // clean up the orphaned file instead of leaving it in storage.
+        if (uploaded) {
+          supabase.storage.from("photos").remove([path]).catch(() => {});
+        }
       }
       setUploadProgress({ done: i + 1, total: items.length });
       if (i < items.length - 1) await sleep(120); // avoid bursting requests
