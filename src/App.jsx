@@ -144,22 +144,37 @@ const GATE_CSS = `
 `;
 
 function SignIn() {
+  const [stage, setStage] = useState("email"); // "email" | "code"
   const [email, setEmail] = useState("");
-  const [sent, setSent] = useState(false);
+  const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  async function handleSubmit(e) {
+  async function sendCode(e) {
     e.preventDefault();
     setBusy(true);
     setError("");
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: window.location.origin },
-    });
+    const { error } = await supabase.auth.signInWithOtp({ email });
     setBusy(false);
     if (error) setError(error.message);
-    else setSent(true);
+    else setStage("code");
+  }
+
+  async function confirmCode(e) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    const { error } = await supabase.auth.verifyOtp({
+      email,
+      token: code.trim(),
+      type: "email",
+    });
+    setBusy(false);
+    if (error) {
+      setError("コードが正しくないか、期限切れの可能性があります。もう一度お試しください。");
+    }
+    // On success, the session updates automatically and App.jsx moves on —
+    // nothing else to do here.
   }
 
   return (
@@ -170,13 +185,8 @@ function SignIn() {
           <Film size={20} strokeWidth={1.75} />
           <span>フィルムキャビネット</span>
         </div>
-        {sent ? (
-          <p>
-            <strong style={{ color: "#eaf3ff" }}>{email}</strong>{" "}
-            宛にログイン用のリンクを送信しました。メールを確認してリンクを開いてください。
-          </p>
-        ) : (
-          <form onSubmit={handleSubmit}>
+        {stage === "email" ? (
+          <form onSubmit={sendCode}>
             <h2>メールアドレスでログイン</h2>
             <input
               type="email"
@@ -188,11 +198,44 @@ function SignIn() {
             {error && <p className="gate-error">{error}</p>}
             <button type="submit" disabled={busy}>
               {busy && <Loader2 size={15} className="spin" />}
-              ログインリンクを送る
+              確認コードを送る
             </button>
             <p style={{ marginTop: 14, fontSize: 11.5 }}>
-              パスワードは不要です。届いたメール内のリンクを開くとログインできます。
+              パスワードは不要です。届いたメール内の6桁のコードをこの画面で入力してログインします。
             </p>
+          </form>
+        ) : (
+          <form onSubmit={confirmCode}>
+            <h2>確認コードを入力</h2>
+            <p>
+              <strong style={{ color: "#eaf3ff" }}>{email}</strong>{" "}
+              宛に6桁のコードを送信しました。メールを確認して入力してください。
+            </p>
+            <input
+              inputMode="numeric"
+              autoFocus
+              maxLength={6}
+              placeholder="123456"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              style={{ textAlign: "center", letterSpacing: "0.3em", fontSize: 20 }}
+            />
+            {error && <p className="gate-error">{error}</p>}
+            <button type="submit" disabled={busy || code.trim().length < 6}>
+              {busy && <Loader2 size={15} className="spin" />}
+              ログイン
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => {
+                setStage("email");
+                setCode("");
+                setError("");
+              }}
+            >
+              メールアドレスを変更する
+            </button>
           </form>
         )}
       </div>
