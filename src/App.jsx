@@ -154,16 +154,6 @@ const GATE_CSS = `
   font-size: 12px;
   font-weight: 400;
 }
-.gate-link {
-  width: auto !important;
-  background: none !important;
-  color: #7c8ba8 !important;
-  font-size: 11.5px !important;
-  font-weight: 400 !important;
-  padding: 6px 0 !important;
-  margin-top: 4px;
-}
-.gate-link:hover { color: #35e6ff !important; }
 .gate-checkbox-row {
   display: flex;
   align-items: flex-start;
@@ -192,13 +182,21 @@ const GATE_CSS = `
 @keyframes gate-spin { to { transform: rotate(360deg); } }
 `;
 
-function SignIn({ onEnterRoom }) {
+function SignIn({ onReady }) {
   const [mode, setMode] = useState("login"); // "login" | "signup"
   const [stage, setStage] = useState("email"); // "email" | "code"
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  const [roomPassword, setRoomPassword] = useState("");
+  const [roomBusy, setRoomBusy] = useState(false);
+  const [roomError, setRoomError] = useState("");
+
+  const [inviteCode, setInviteCode] = useState("");
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [inviteError, setInviteError] = useState("");
 
   function switchMode(next) {
     setMode(next);
@@ -246,6 +244,75 @@ function SignIn({ onEnterRoom }) {
     // nothing else to do here.
   }
 
+  // Ensures some session exists (creating an anonymous one if needed) so
+  // that RLS/RPC calls requiring auth.uid() work without an email login.
+  async function ensureSession() {
+    const { data } = await supabase.auth.getSession();
+    if (data.session) return data.session;
+    const { data: anonData, error } = await supabase.auth.signInAnonymously();
+    if (error) throw error;
+    return anonData.session;
+  }
+
+  async function enterSecretRoom(e) {
+    e.preventDefault();
+    setRoomBusy(true);
+    setRoomError("");
+    try {
+      await ensureSession();
+    } catch {
+      setRoomBusy(false);
+      setRoomError(
+        "入室機能が有効になっていません。管理者に「匿名ログイン」の設定を確認してもらってください。"
+      );
+      return;
+    }
+    const { data, error } = await supabase.rpc("join_secret_room", {
+      room_password: roomPassword,
+    });
+    setRoomBusy(false);
+    if (error || !data || !data[0]) {
+      setRoomError("パスワードが正しくありません。");
+      return;
+    }
+    onReady(data[0]);
+  }
+
+  async function joinByInviteCode(e) {
+    e.preventDefault();
+    setInviteBusy(true);
+    setInviteError("");
+    let session;
+    try {
+      session = await ensureSession();
+    } catch {
+      setInviteBusy(false);
+      setInviteError(
+        "参加機能が有効になっていません。管理者に「匿名ログイン」の設定を確認してもらってください。"
+      );
+      return;
+    }
+    const { data, error } = await supabase
+      .from("libraries")
+      .select("*")
+      .eq("invite_code", inviteCode.trim())
+      .maybeSingle();
+    if (error || !data) {
+      setInviteBusy(false);
+      setInviteError("招待コードが見つかりませんでした");
+      return;
+    }
+    const { error: memberErr } = await supabase
+      .from("library_members")
+      .upsert({ library_id: data.id, user_id: session.user.id });
+    setInviteBusy(false);
+    if (memberErr) {
+      setInviteError(memberErr.message);
+      return;
+    }
+    onReady(data);
+  }
+
   return (
     <div className="gate-root">
       <style>{GATE_CSS}</style>
@@ -275,33 +342,71 @@ function SignIn({ onEnterRoom }) {
         )}
 
         {stage === "email" ? (
-          <form onSubmit={sendCode}>
-            <h2>{mode === "signup" ? "新しいアカウントを作成" : "メールアドレスでログイン"}</h2>
-            <input
-              type="email"
-              required
-              placeholder="you@example.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-            {error && <p className="gate-error">{error}</p>}
-            <button type="submit" disabled={busy}>
-              {busy && <Loader2 size={15} className="spin" />}
-              確認コードを送る
-            </button>
-            <p style={{ marginTop: 14, fontSize: 11.5 }}>
-              パスワードは不要です。届いたメール内の確認コードをこの画面で入力して
-              {mode === "signup" ? "アカウントを作成します。" : "ログインします。"}
-            </p>
-            <button
-              type="button"
-              className="gate-link"
-              onClick={onEnterRoom}
-            >
-              <KeyRound size={12} style={{ marginRight: 4 }} />
-              メールを使わずシークレットルームで入る
-            </button>
-          </form>
+          <>
+            <form onSubmit={sendCode}>
+              <h2>{mode === "signup" ? "新しいアカウントを作成" : "メールアドレスでログイン"}</h2>
+              <input
+                type="email"
+                required
+                placeholder="you@example.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+              {error && <p className="gate-error">{error}</p>}
+              <button type="submit" disabled={busy}>
+                {busy && <Loader2 size={15} className="spin" />}
+                確認コードを送る
+              </button>
+              <p style={{ marginTop: 14, fontSize: 11.5 }}>
+                パスワードは不要です。届いたメール内の確認コードをこの画面で入力して
+                {mode === "signup" ? "アカウントを作成します。" : "ログインします。"}
+              </p>
+            </form>
+
+            <div className="gate-divider">または</div>
+
+            <form onSubmit={enterSecretRoom}>
+              <h2>
+                <KeyRound size={14} style={{ marginRight: 5, verticalAlign: -2 }} />
+                シークレットルームで入る
+              </h2>
+              <input
+                type="password"
+                placeholder="共通パスワード"
+                value={roomPassword}
+                onChange={(e) => setRoomPassword(e.target.value)}
+              />
+              {roomError && <p className="gate-error">{roomError}</p>}
+              <button
+                type="submit"
+                className="secondary"
+                disabled={roomBusy || roomPassword.length === 0}
+              >
+                {roomBusy && <Loader2 size={15} className="spin" />}
+                入る
+              </button>
+            </form>
+
+            <div className="gate-divider">または</div>
+
+            <form onSubmit={joinByInviteCode}>
+              <h2>招待コードで参加</h2>
+              <input
+                placeholder="招待コードを入力"
+                value={inviteCode}
+                onChange={(e) => setInviteCode(e.target.value)}
+              />
+              {inviteError && <p className="gate-error">{inviteError}</p>}
+              <button
+                type="submit"
+                className="secondary"
+                disabled={inviteBusy || inviteCode.trim().length === 0}
+              >
+                {inviteBusy && <Loader2 size={15} className="spin" />}
+                参加する
+              </button>
+            </form>
+          </>
         ) : (
           <form onSubmit={confirmCode}>
             <h2>確認コードを入力</h2>
@@ -335,73 +440,6 @@ function SignIn({ onEnterRoom }) {
             </button>
           </form>
         )}
-      </div>
-    </div>
-  );
-}
-
-function SecretRoomEntry({ onBack, onReady }) {
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-
-  async function enterRoom(e) {
-    e.preventDefault();
-    setBusy(true);
-    setError("");
-
-    // Make sure we have some session (anonymous is fine) before calling
-    // the RPC, since it needs auth.uid() to record membership.
-    let { data: sessionData } = await supabase.auth.getSession();
-    if (!sessionData.session) {
-      const { error: anonErr } = await supabase.auth.signInAnonymously();
-      if (anonErr) {
-        setBusy(false);
-        setError(
-          "入室機能が有効になっていません。管理者に「匿名ログイン」の設定を確認してもらってください。"
-        );
-        return;
-      }
-    }
-
-    const { data, error } = await supabase.rpc("join_secret_room", {
-      room_password: password,
-    });
-    setBusy(false);
-    if (error || !data || !data[0]) {
-      setError("パスワードが正しくありません。");
-      return;
-    }
-    onReady(data[0]);
-  }
-
-  return (
-    <div className="gate-root">
-      <style>{GATE_CSS}</style>
-      <div className="gate-card">
-        <div className="gate-brand">
-          <KeyRound size={20} strokeWidth={1.75} />
-          <span>シークレットルーム</span>
-        </div>
-        <form onSubmit={enterRoom}>
-          <h2>共通パスワードを入力</h2>
-          <input
-            type="password"
-            required
-            autoFocus
-            placeholder="パスワード"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-          {error && <p className="gate-error">{error}</p>}
-          <button type="submit" disabled={busy || password.length === 0}>
-            {busy && <Loader2 size={15} className="spin" />}
-            入る
-          </button>
-          <button type="button" className="secondary" onClick={onBack}>
-            メールでログインする
-          </button>
-        </form>
       </div>
     </div>
   );
@@ -632,7 +670,6 @@ export default function App() {
   const [session, setSession] = useState(undefined); // undefined = loading
   const [library, setLibrary] = useState(null);
   const [showInvite, setShowInvite] = useState(false);
-  const [landingMode, setLandingMode] = useState("email"); // "email" | "room"
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -653,16 +690,7 @@ export default function App() {
   }
 
   if (!session) {
-    return landingMode === "room" ? (
-      <SecretRoomEntry
-        onBack={() => setLandingMode("email")}
-        onReady={(lib) => {
-          setLibrary(lib);
-        }}
-      />
-    ) : (
-      <SignIn onEnterRoom={() => setLandingMode("room")} />
-    );
+    return <SignIn onReady={(lib) => setLibrary(lib)} />;
   }
 
   if (!library) {
