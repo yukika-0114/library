@@ -65,6 +65,28 @@ const GATE_CSS = `
   gap: 8px;
 }
 .gate-card button:disabled { opacity: 0.6; }
+.gate-tabs {
+  display: flex;
+  gap: 6px;
+  background: #121a2c;
+  border: 1px solid #223049;
+  border-radius: 9px;
+  padding: 3px;
+  margin-bottom: 18px;
+}
+.gate-tabs button {
+  width: auto;
+  flex: 1;
+  background: transparent;
+  color: #7c8ba8;
+  padding: 8px 10px;
+  font-size: 13px;
+  border-radius: 6px;
+}
+.gate-tabs button.active {
+  background: #35e6ff;
+  color: #06121a;
+}
 .gate-card button.secondary {
   background: transparent;
   border: 1px solid #223049;
@@ -144,20 +166,40 @@ const GATE_CSS = `
 `;
 
 function SignIn() {
+  const [mode, setMode] = useState("login"); // "login" | "signup"
   const [stage, setStage] = useState("email"); // "email" | "code"
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  function switchMode(next) {
+    setMode(next);
+    setStage("email");
+    setCode("");
+    setError("");
+  }
+
   async function sendCode(e) {
     e.preventDefault();
     setBusy(true);
     setError("");
-    const { error } = await supabase.auth.signInWithOtp({ email });
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: { shouldCreateUser: mode === "signup" },
+    });
     setBusy(false);
-    if (error) setError(error.message);
-    else setStage("code");
+    if (error) {
+      if (mode === "login" && /signup|not found|not allowed/i.test(error.message)) {
+        setError(
+          "このメールアドレスのアカウントが見つかりませんでした。初めての方は「新規作成」からどうぞ。"
+        );
+      } else {
+        setError(error.message);
+      }
+      return;
+    }
+    setStage("code");
   }
 
   async function confirmCode(e) {
@@ -185,9 +227,29 @@ function SignIn() {
           <Film size={20} strokeWidth={1.75} />
           <span>フィルムキャビネット</span>
         </div>
+
+        {stage === "email" && (
+          <div className="gate-tabs">
+            <button
+              type="button"
+              className={mode === "login" ? "active" : ""}
+              onClick={() => switchMode("login")}
+            >
+              ログイン
+            </button>
+            <button
+              type="button"
+              className={mode === "signup" ? "active" : ""}
+              onClick={() => switchMode("signup")}
+            >
+              新規作成
+            </button>
+          </div>
+        )}
+
         {stage === "email" ? (
           <form onSubmit={sendCode}>
-            <h2>メールアドレスでログイン</h2>
+            <h2>{mode === "signup" ? "新しいアカウントを作成" : "メールアドレスでログイン"}</h2>
             <input
               type="email"
               required
@@ -201,7 +263,8 @@ function SignIn() {
               確認コードを送る
             </button>
             <p style={{ marginTop: 14, fontSize: 11.5 }}>
-              パスワードは不要です。届いたメール内の確認コードをこの画面で入力してログインします。
+              パスワードは不要です。届いたメール内の確認コードをこの画面で入力して
+              {mode === "signup" ? "アカウントを作成します。" : "ログインします。"}
             </p>
           </form>
         ) : (
@@ -222,7 +285,7 @@ function SignIn() {
             {error && <p className="gate-error">{error}</p>}
             <button type="submit" disabled={busy || code.trim().length === 0}>
               {busy && <Loader2 size={15} className="spin" />}
-              ログイン
+              {mode === "signup" ? "作成してログイン" : "ログイン"}
             </button>
             <button
               type="button"
