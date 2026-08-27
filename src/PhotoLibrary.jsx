@@ -363,7 +363,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const id = genId();
+      const id = crypto.randomUUID();
       const path = `${library.id}/${id}.jpg`;
       try {
         const { error: upErr } = await supabase.storage
