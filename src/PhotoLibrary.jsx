@@ -205,6 +205,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const fileInputRef = useRef(null);
+  const lbScrollRef = useRef(null);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
@@ -363,7 +364,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const id = crypto.randomUUID();
+      const id = genId();
       const path = `${library.id}/${id}.jpg`;
       try {
         const { error: upErr } = await supabase.storage
@@ -634,6 +635,34 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     const next =
       (lightboxIdx + delta + filtered.length) % filtered.length;
     setLightboxId(filtered[next].id);
+  }
+
+  // Keep the horizontal-scroll strip positioned on whichever photo
+  // lightboxId points to (e.g. when first opened, or moved via keyboard).
+  useEffect(() => {
+    if (!lightboxId || !lbScrollRef.current) return;
+    const idx = filtered.findIndex((p) => p.id === lightboxId);
+    if (idx < 0) return;
+    const el = lbScrollRef.current;
+    const target = idx * el.clientWidth;
+    if (Math.abs(el.scrollLeft - target) > 4) {
+      el.scrollTo({ left: target, behavior: "instant" });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lightboxId]);
+
+  // As the user swipes/scrolls the strip, update lightboxId to match
+  // whichever photo is currently centered.
+  const lbScrollTimer = useRef(null);
+  function handleLbScroll() {
+    const el = lbScrollRef.current;
+    if (!el) return;
+    clearTimeout(lbScrollTimer.current);
+    lbScrollTimer.current = setTimeout(() => {
+      const idx = Math.round(el.scrollLeft / el.clientWidth);
+      const p = filtered[idx];
+      if (p && p.id !== lightboxId) setLightboxId(p.id);
+    }, 100);
   }
 
   useEffect(() => {
@@ -1173,36 +1202,32 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             <button className="pl-lb-close" onClick={() => setLightboxId(null)}>
               <X size={18} />
             </button>
-            <button
-              className="pl-lb-nav left"
-              onClick={() => stepLightbox(-1)}
-              disabled={filtered.length < 2}
-            >
-              <ChevronLeft size={22} />
-            </button>
             <div
-              className={`pl-lb-imgstage ${
+              className={`pl-lb-stage-wrap ${
                 isAchieved(lightboxPhoto) ? "achieved-glow" : ""
               }`}
             >
-              {lightboxPhoto.url ? (
-                <img
-                  src={lightboxPhoto.url}
-                  alt={lightboxPhoto.title}
-                  className={isAchieved(lightboxPhoto) ? "" : "pl-photo-mono"}
-                />
-              ) : (
-                <Loader2 size={24} className="spin" />
-              )}
+              <div
+                className="pl-lb-imgstage-scroll"
+                ref={lbScrollRef}
+                onScroll={handleLbScroll}
+              >
+                {filtered.map((p) => (
+                  <div className="pl-lb-imgstage-item" key={p.id}>
+                    {p.url ? (
+                      <img
+                        src={p.url}
+                        alt={p.title}
+                        className={isAchieved(p) ? "" : "pl-photo-mono"}
+                      />
+                    ) : (
+                      <Loader2 size={24} className="spin" />
+                    )}
+                  </div>
+                ))}
+              </div>
               <FrameBadge n={frameNumbers.get(lightboxPhoto.id) || lightboxIdx + 1} />
             </div>
-            <button
-              className="pl-lb-nav right"
-              onClick={() => stepLightbox(1)}
-              disabled={filtered.length < 2}
-            >
-              <ChevronRight size={22} />
-            </button>
 
             <div className="pl-lb-meta">
               <div className="pl-lb-meta-row">
@@ -1684,7 +1709,7 @@ const CSS = `
   min-height: 640px;
   max-height: 100vh;
   max-height: 100dvh;
-  border-radius: 10px;
+  border-radius: 0;
   overflow-y: auto;
   overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
@@ -2639,40 +2664,42 @@ const CSS = `
   z-index: 3;
 }
 .pl-lb-close:hover { color: var(--accent); }
-.pl-lb-nav {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  background: rgba(4,6,10,0.55);
-  border: none;
-  color: var(--text);
-  width: 34px; height: 34px;
-  border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  z-index: 3;
-}
-.pl-lb-nav:hover { color: var(--accent); }
-.pl-lb-nav:disabled { opacity: 0.25; cursor: default; }
-.pl-lb-nav.left { left: 12px; }
-.pl-lb-nav.right { right: 312px; }
 
-.pl-lb-imgstage {
-  background: var(--photo-bg);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.pl-lb-stage-wrap {
   position: relative;
+  background: var(--photo-bg);
+  overflow: hidden;
   min-height: 320px;
   transition: box-shadow 0.6s ease;
 }
-.pl-lb-imgstage img {
+.pl-lb-imgstage-scroll {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.pl-lb-imgstage-scroll::-webkit-scrollbar { display: none; }
+.pl-lb-imgstage-item {
+  flex: 0 0 100%;
+  scroll-snap-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 320px;
+}
+.pl-lb-imgstage-item img {
   max-width: 100%;
   max-height: 88vh;
   object-fit: contain;
   transition: filter 0.6s ease;
 }
-.pl-lb-imgstage .frame-badge { top: 12px; left: 12px; bottom: auto; }
-.pl-lb-imgstage.achieved-glow {
+.pl-lb-stage-wrap .frame-badge { top: 12px; left: 12px; bottom: auto; z-index: 3; }
+.pl-lb-stage-wrap.achieved-glow {
   box-shadow:
     inset 0 0 0 2px var(--accent),
     inset 0 0 calc(46px * var(--glow-intensity)) calc(8px * var(--glow-intensity)) rgba(var(--accent-rgb),calc(0.4 * var(--glow-intensity))),
@@ -2953,7 +2980,6 @@ const CSS = `
   .pl-mobile-fab:disabled { opacity: 0.6; }
 
   .pl-lightbox { grid-template-columns: 1fr; overflow-y: auto; }
-  .pl-lb-nav.right { right: 12px; }
   .pl-lb-meta { padding-top: 20px; }
   .pl-settings-modal, .pl-naming-modal, .pl-confirm-modal { max-width: 100%; }
 
