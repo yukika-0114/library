@@ -201,7 +201,7 @@ function SignIn() {
               確認コードを送る
             </button>
             <p style={{ marginTop: 14, fontSize: 11.5 }}>
-              パスワードは不要です。届いたメール内の6桁のコードをこの画面で入力してログインします。
+              パスワードは不要です。届いたメール内の確認コードをこの画面で入力してログインします。
             </p>
           </form>
         ) : (
@@ -209,19 +209,18 @@ function SignIn() {
             <h2>確認コードを入力</h2>
             <p>
               <strong style={{ color: "#eaf3ff" }}>{email}</strong>{" "}
-              宛に6桁のコードを送信しました。メールを確認して入力してください。
+              宛に確認コードを送信しました。メールを確認して入力してください。
             </p>
             <input
               inputMode="numeric"
               autoFocus
-              maxLength={6}
-              placeholder="123456"
+              placeholder="コードを入力"
               value={code}
               onChange={(e) => setCode(e.target.value)}
               style={{ textAlign: "center", letterSpacing: "0.3em", fontSize: 20 }}
             />
             {error && <p className="gate-error">{error}</p>}
-            <button type="submit" disabled={busy || code.trim().length < 6}>
+            <button type="submit" disabled={busy || code.trim().length === 0}>
               {busy && <Loader2 size={15} className="spin" />}
               ログイン
             </button>
