@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { supabase } from "./supabaseClient.js";
 import PhotoLibrary from "./PhotoLibrary.jsx";
-import { Film, Loader2, Copy, Check, LogOut } from "lucide-react";
+import { Film, Loader2, Copy, Check, LogOut, KeyRound } from "lucide-react";
 
 const GATE_CSS = `
 .gate-root {
@@ -154,6 +154,33 @@ const GATE_CSS = `
   font-size: 12px;
   font-weight: 400;
 }
+.gate-link {
+  width: auto !important;
+  background: none !important;
+  color: #7c8ba8 !important;
+  font-size: 11.5px !important;
+  font-weight: 400 !important;
+  padding: 6px 0 !important;
+  margin-top: 4px;
+}
+.gate-link:hover { color: #35e6ff !important; }
+.gate-checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 4px 0 10px;
+  cursor: pointer;
+}
+.gate-checkbox-row input[type="checkbox"] {
+  width: auto;
+  margin: 3px 0 0;
+  accent-color: #35e6ff;
+}
+.gate-checkbox-row span {
+  font-size: 12px;
+  color: #7c8ba8;
+  line-height: 1.5;
+}
 .gate-loading {
   display: flex;
   align-items: center;
@@ -165,7 +192,7 @@ const GATE_CSS = `
 @keyframes gate-spin { to { transform: rotate(360deg); } }
 `;
 
-function SignIn() {
+function SignIn({ onEnterRoom }) {
   const [mode, setMode] = useState("login"); // "login" | "signup"
   const [stage, setStage] = useState("email"); // "email" | "code"
   const [email, setEmail] = useState("");
@@ -266,6 +293,14 @@ function SignIn() {
               パスワードは不要です。届いたメール内の確認コードをこの画面で入力して
               {mode === "signup" ? "アカウントを作成します。" : "ログインします。"}
             </p>
+            <button
+              type="button"
+              className="gate-link"
+              onClick={onEnterRoom}
+            >
+              <KeyRound size={12} style={{ marginRight: 4 }} />
+              メールを使わずシークレットルームで入る
+            </button>
           </form>
         ) : (
           <form onSubmit={confirmCode}>
@@ -305,10 +340,79 @@ function SignIn() {
   );
 }
 
+function SecretRoomEntry({ onBack, onReady }) {
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function enterRoom(e) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+
+    // Make sure we have some session (anonymous is fine) before calling
+    // the RPC, since it needs auth.uid() to record membership.
+    let { data: sessionData } = await supabase.auth.getSession();
+    if (!sessionData.session) {
+      const { error: anonErr } = await supabase.auth.signInAnonymously();
+      if (anonErr) {
+        setBusy(false);
+        setError(
+          "入室機能が有効になっていません。管理者に「匿名ログイン」の設定を確認してもらってください。"
+        );
+        return;
+      }
+    }
+
+    const { data, error } = await supabase.rpc("join_secret_room", {
+      room_password: password,
+    });
+    setBusy(false);
+    if (error || !data || !data[0]) {
+      setError("パスワードが正しくありません。");
+      return;
+    }
+    onReady(data[0]);
+  }
+
+  return (
+    <div className="gate-root">
+      <style>{GATE_CSS}</style>
+      <div className="gate-card">
+        <div className="gate-brand">
+          <KeyRound size={20} strokeWidth={1.75} />
+          <span>シークレットルーム</span>
+        </div>
+        <form onSubmit={enterRoom}>
+          <h2>共通パスワードを入力</h2>
+          <input
+            type="password"
+            required
+            autoFocus
+            placeholder="パスワード"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          {error && <p className="gate-error">{error}</p>}
+          <button type="submit" disabled={busy || password.length === 0}>
+            {busy && <Loader2 size={15} className="spin" />}
+            入る
+          </button>
+          <button type="button" className="secondary" onClick={onBack}>
+            メールでログインする
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function LibraryGate({ session, onReady }) {
   const [libraries, setLibraries] = useState(null);
   const [newName, setNewName] = useState("");
   const [joinCode, setJoinCode] = useState("");
+  const [secretMode, setSecretMode] = useState(false);
+  const [secretPassword, setSecretPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -334,6 +438,21 @@ function LibraryGate({ session, onReady }) {
     e.preventDefault();
     setBusy(true);
     setError("");
+
+    if (secretMode) {
+      const { data, error } = await supabase.rpc("create_secret_room", {
+        room_name: newName.trim(),
+        room_password: secretPassword,
+      });
+      setBusy(false);
+      if (error || !data || !data[0]) {
+        setError(error?.message || "作成に失敗しました");
+        return;
+      }
+      onReady(data[0]);
+      return;
+    }
+
     const { data, error } = await supabase
       .from("libraries")
       .insert({ name: newName.trim() || "マイライブラリ" })
@@ -424,7 +543,28 @@ function LibraryGate({ session, onReady }) {
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
           />
-          <button type="submit" disabled={busy}>
+          <label className="gate-checkbox-row">
+            <input
+              type="checkbox"
+              checked={secretMode}
+              onChange={(e) => setSecretMode(e.target.checked)}
+            />
+            <span>
+              シークレットルームにする(メール不要・共通パスワードで誰でも入室可)
+            </span>
+          </label>
+          {secretMode && (
+            <input
+              type="password"
+              placeholder="共通パスワード(4文字以上)"
+              value={secretPassword}
+              onChange={(e) => setSecretPassword(e.target.value)}
+            />
+          )}
+          <button
+            type="submit"
+            disabled={busy || (secretMode && secretPassword.length < 4)}
+          >
             {busy && <Loader2 size={15} className="spin" />}
             作成する
           </button>
@@ -492,6 +632,7 @@ export default function App() {
   const [session, setSession] = useState(undefined); // undefined = loading
   const [library, setLibrary] = useState(null);
   const [showInvite, setShowInvite] = useState(false);
+  const [landingMode, setLandingMode] = useState("email"); // "email" | "room"
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -511,7 +652,18 @@ export default function App() {
     );
   }
 
-  if (!session) return <SignIn />;
+  if (!session) {
+    return landingMode === "room" ? (
+      <SecretRoomEntry
+        onBack={() => setLandingMode("email")}
+        onReady={(lib) => {
+          setLibrary(lib);
+        }}
+      />
+    ) : (
+      <SignIn onEnterRoom={() => setLandingMode("room")} />
+    );
+  }
 
   if (!library) {
     return (
