@@ -152,7 +152,9 @@ function FrameBadge({ n }) {
 export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [photos, setPhotos] = useState(null); // null = loading
   const [albums, setAlbums] = useState([]); // [{id, name}]
-  const [memberships, setMemberships] = useState(new Map()); // photoId -> [{albumId, albumName, current, target}]
+  const [memberships, setMemberships] = useState(new Map()); // photoId -> [{albumId, albumName, current, target}] (ギフトボード)
+  const [folders, setFolders] = useState([]); // [{id, name}] — plain アルバム, no achievement
+  const [folderMemberships, setFolderMemberships] = useState(new Map()); // photoId -> [{folderId, folderName}]
   const [view, setView] = useState({ type: "all" }); // {type:'all'|'fav'|'album'|'tag', value}
 
   useEffect(() => {
@@ -189,6 +191,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [orderDraft, setOrderDraft] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [confirmDeleteAlbum, setConfirmDeleteAlbum] = useState(null); // album name or null
+  const [confirmDeleteFolder, setConfirmDeleteFolder] = useState(null); // folder name or null
   const [confirmDeleteTag, setConfirmDeleteTag] = useState(null); // tag or null
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -197,6 +200,8 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [dragOver, setDragOver] = useState(false);
   const [newAlbumOpen, setNewAlbumOpen] = useState(false);
   const [newAlbumName, setNewAlbumName] = useState("");
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
   const [toast, setToast] = useState(null);
   const [syncError, setSyncError] = useState(false);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -213,7 +218,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
   // ---- load library from Supabase, and stay in sync across devices ----
   const loadAll = useCallback(async () => {
-    const [photosRes, albumsRes, settingsRes] = await Promise.all([
+    const [photosRes, albumsRes, foldersRes, settingsRes] = await Promise.all([
       supabase
         .from("photos")
         .select("*")
@@ -225,19 +230,26 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         .eq("library_id", library.id)
         .order("created_at", { ascending: true }),
       supabase
+        .from("folders")
+        .select("*")
+        .eq("library_id", library.id)
+        .order("created_at", { ascending: true }),
+      supabase
         .from("library_settings")
         .select("*")
         .eq("library_id", library.id)
         .maybeSingle(),
     ]);
 
-    if (photosRes.error || albumsRes.error) {
-      console.error(photosRes.error || albumsRes.error);
+    if (photosRes.error || albumsRes.error || foldersRes.error) {
+      console.error(photosRes.error || albumsRes.error || foldersRes.error);
       setSyncError(true);
     }
     setPhotos((photosRes.data || []).map(mapPhotoRow));
     const albumRows = albumsRes.data || [];
     setAlbums(albumRows.map((a) => ({ id: a.id, name: a.name })));
+    const folderRows = foldersRes.data || [];
+    setFolders(folderRows.map((f) => ({ id: f.id, name: f.name })));
 
     const albumIds = albumRows.map((a) => a.id);
     const albumNameById = new Map(albumRows.map((a) => [a.id, a.name]));
@@ -263,6 +275,29 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       });
     }
     setMemberships(mMap);
+
+    const folderIds = folderRows.map((f) => f.id);
+    const folderNameById = new Map(folderRows.map((f) => [f.id, f.name]));
+    const fMap = new Map();
+    if (folderIds.length) {
+      const { data: folRows, error: folErr } = await supabase
+        .from("photo_folders")
+        .select("photo_id, folder_id")
+        .in("folder_id", folderIds);
+      if (folErr) {
+        console.error(folErr);
+        setSyncError(true);
+      }
+      (folRows || []).forEach((row) => {
+        const entry = {
+          folderId: row.folder_id,
+          folderName: folderNameById.get(row.folder_id) || "",
+        };
+        if (!fMap.has(row.photo_id)) fMap.set(row.photo_id, []);
+        fMap.get(row.photo_id).push(entry);
+      });
+    }
+    setFolderMemberships(fMap);
 
     if (settingsRes.data) {
       setSettings({
@@ -291,10 +326,20 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         () => loadAll()
       )
       .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "folders", filter: `library_id=eq.${library.id}` },
+        () => loadAll()
+      )
+      .on(
         // photo_albums has no library_id column to filter by directly, so
         // listen unfiltered and just refetch — fine at personal-library scale.
         "postgres_changes",
         { event: "*", schema: "public", table: "photo_albums" },
+        () => loadAll()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "photo_folders" },
         () => loadAll()
       )
       .on(
@@ -430,6 +475,18 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
               });
           }
         }
+        // Same idea for a plain folder (no progress to set).
+        if (view.type === "folder") {
+          const folderId = folders.find((f) => f.name === view.value)?.id;
+          if (folderId) {
+            await supabase
+              .from("photo_folders")
+              .insert({ photo_id: id, folder_id: folderId })
+              .then(({ error }) => {
+                if (error) console.error(error);
+              });
+          }
+        }
         added.push(mapPhotoRow({ ...row, created_at: new Date().toISOString() }));
       } catch (e) {
         console.error(e);
@@ -454,6 +511,20 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             added.forEach((p) => {
               next.set(p.id, [
                 { albumId: albumMatch.id, albumName: albumMatch.name, current: 0, target: 0 },
+              ]);
+            });
+            return next;
+          });
+        }
+      }
+      if (view.type === "folder") {
+        const folderMatch = folders.find((f) => f.name === view.value);
+        if (folderMatch) {
+          setFolderMemberships((prev) => {
+            const next = new Map(prev);
+            added.forEach((p) => {
+              next.set(p.id, [
+                { folderId: folderMatch.id, folderName: folderMatch.name },
               ]);
             });
             return next;
@@ -637,7 +708,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     if (error) {
       console.error(error);
       setSyncError(true);
-      showToast("アルバムの保存に失敗しました");
+      showToast("ギフトボードの保存に失敗しました");
       return;
     }
     setAlbums((prev) => [...prev, { id: data.id, name: data.name }]);
@@ -663,7 +734,88 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         setSyncError(true);
       }
     }
+    showToast(`ギフトボード「${name}」を削除しました`);
+  }
+
+  // ---- folders (アルバム: plain grouping, no achievement) ----
+  async function createFolder(name) {
+    const trimmed = name.trim();
+    if (!trimmed || folders.some((f) => f.name === trimmed)) return;
+    const { data, error } = await supabase
+      .from("folders")
+      .insert({ library_id: library.id, name: trimmed })
+      .select()
+      .single();
+    if (error) {
+      console.error(error);
+      setSyncError(true);
+      showToast("アルバムの保存に失敗しました");
+      return;
+    }
+    setFolders((prev) => [...prev, { id: data.id, name: data.name }]);
+    setView({ type: "folder", value: trimmed });
+  }
+
+  async function deleteFolder(name) {
+    const folderMatch = folders.find((f) => f.name === name);
+    setFolders((prev) => prev.filter((f) => f.name !== name));
+    setFolderMemberships((prev) => {
+      const next = new Map();
+      prev.forEach((list, photoId) => {
+        next.set(photoId, list.filter((m) => m.folderName !== name));
+      });
+      return next;
+    });
+    if (view.type === "folder" && view.value === name) setView({ type: "all" });
+    if (folderMatch) {
+      // Deleting the folder row cascades to remove its photo_folders rows too.
+      const { error } = await supabase.from("folders").delete().eq("id", folderMatch.id);
+      if (error) {
+        console.error(error);
+        setSyncError(true);
+      }
+    }
     showToast(`アルバム「${name}」を削除しました`);
+  }
+
+  async function setPhotoFolderMembership(photoId, folderId, isMember) {
+    setFolderMemberships((prev) => {
+      const next = new Map(prev);
+      const list = next.get(photoId) ? [...next.get(photoId)] : [];
+      if (isMember) {
+        if (!list.some((m) => m.folderId === folderId)) {
+          const folder = folders.find((f) => f.id === folderId);
+          list.push({ folderId, folderName: folder ? folder.name : "" });
+        }
+      } else {
+        const idx = list.findIndex((m) => m.folderId === folderId);
+        if (idx >= 0) list.splice(idx, 1);
+      }
+      next.set(photoId, list);
+      return next;
+    });
+
+    if (isMember) {
+      const { error } = await supabase
+        .from("photo_folders")
+        .upsert({ photo_id: photoId, folder_id: folderId });
+      if (error) {
+        console.error(error);
+        setSyncError(true);
+        showToast("保存に失敗しました");
+      }
+    } else {
+      const { error } = await supabase
+        .from("photo_folders")
+        .delete()
+        .eq("photo_id", photoId)
+        .eq("folder_id", folderId);
+      if (error) {
+        console.error(error);
+        setSyncError(true);
+        showToast("保存に失敗しました");
+      }
+    }
   }
 
   async function deleteTag(tag) {
@@ -698,12 +850,15 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     setPhotos([]);
     setAlbums([]);
     setMemberships(new Map());
+    setFolders([]);
+    setFolderMemberships(new Map());
     setView({ type: "all" });
     setQuery("");
     try {
       if (paths.length) await supabase.storage.from("photos").remove(paths);
       await supabase.from("photos").delete().eq("library_id", library.id);
       await supabase.from("albums").delete().eq("library_id", library.id);
+      await supabase.from("folders").delete().eq("library_id", library.id);
     } catch (e) {
       console.error(e);
       setSyncError(true);
@@ -729,6 +884,16 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     return m;
   }, [albums, memberships]);
 
+  const folderCounts = useMemo(() => {
+    const m = new Map(folders.map((f) => [f.name, 0]));
+    folderMemberships.forEach((list) => {
+      list.forEach((entry) => {
+        m.set(entry.folderName, (m.get(entry.folderName) || 0) + 1);
+      });
+    });
+    return m;
+  }, [folders, folderMemberships]);
+
   const frameNumbers = useMemo(() => {
     const m = new Map();
     (photos || []).forEach((p, i) => m.set(p.id, i + 1));
@@ -739,6 +904,10 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   // an album context, so isAchieved needs to know which album to check.
   function membershipFor(photoId, albumName) {
     return (memberships.get(photoId) || []).find((m) => m.albumName === albumName);
+  }
+
+  function folderMembershipFor(photoId, folderName) {
+    return (folderMemberships.get(photoId) || []).find((m) => m.folderName === folderName);
   }
 
   function isAchieved(photoId, albumName) {
@@ -755,6 +924,11 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         (memberships.get(p.id) || []).some((m) => m.albumName === view.value)
       );
     }
+    if (view.type === "folder") {
+      list = list.filter((p) =>
+        (folderMemberships.get(p.id) || []).some((m) => m.folderName === view.value)
+      );
+    }
     if (view.type === "tag")
       list = list.filter((p) => (p.tags || []).includes(view.value));
     const qRaw = query.trim();
@@ -766,17 +940,19 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         const numStr = num != null ? String(num) : "";
         const numPadded = num != null ? String(num).padStart(3, "0") : "";
         const albumNames = (memberships.get(p.id) || []).map((m) => m.albumName);
+        const folderNames = (folderMemberships.get(p.id) || []).map((m) => m.folderName);
         return (
           p.title.toLowerCase().includes(q) ||
           (p.tags || []).some((t) => t.toLowerCase().includes(qTag)) ||
           albumNames.some((n) => n.toLowerCase().includes(q)) ||
+          folderNames.some((n) => n.toLowerCase().includes(q)) ||
           numStr === qRaw ||
           numPadded.includes(qRaw)
         );
       });
     }
     return list;
-  }, [photos, view, query, frameNumbers, memberships]);
+  }, [photos, view, query, frameNumbers, memberships, folderMemberships]);
 
   // Achievement only applies inside a specific album view — "all photos"
   // and other views don't track/display it at all.
@@ -881,7 +1057,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       ? "全ての写真"
       : view.type === "fav"
       ? "お気に入り"
-      : view.type === "album"
+      : view.type === "album" || view.type === "folder"
       ? view.value
       : `#${view.value}`;
 
@@ -966,10 +1142,10 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
         <nav className="pl-nav">
           <div className="pl-nav-label-row">
-            <span className="pl-nav-label">アルバム</span>
+            <span className="pl-nav-label">ギフトボード</span>
             <button
               className="pl-icon-btn"
-              title="新しいアルバム"
+              title="新しいギフトボード"
               onClick={() => setNewAlbumOpen((v) => !v)}
             >
               <Plus size={13} />
@@ -979,7 +1155,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             <div className="pl-new-album">
               <input
                 autoFocus
-                placeholder="アルバム名"
+                placeholder="ギフトボード名"
                 value={newAlbumName}
                 onChange={(e) => setNewAlbumName(e.target.value)}
                 onFocus={(e) => e.target.select()}
@@ -1029,10 +1205,87 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
               </button>
               <button
                 className="pl-nav-item-del"
-                title="アルバムを削除"
+                title="ギフトボードを削除"
                 onClick={(e) => {
                   e.stopPropagation();
                   setConfirmDeleteAlbum(a.name);
+                }}
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </nav>
+
+        <nav className="pl-nav">
+          <div className="pl-nav-label-row">
+            <span className="pl-nav-label">アルバム</span>
+            <button
+              className="pl-icon-btn"
+              title="新しいアルバム"
+              onClick={() => setNewFolderOpen((v) => !v)}
+            >
+              <Plus size={13} />
+            </button>
+          </div>
+          {newFolderOpen && (
+            <div className="pl-new-album">
+              <input
+                autoFocus
+                placeholder="アルバム名"
+                value={newFolderName}
+                onChange={(e) => setNewFolderName(e.target.value)}
+                onFocus={(e) => e.target.select()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    if (newFolderName.trim()) {
+                      createFolder(newFolderName);
+                      setNewFolderName("");
+                    }
+                    setNewFolderOpen(false);
+                  } else if (e.key === "Escape") {
+                    setNewFolderName("");
+                    setNewFolderOpen(false);
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="pl-icon-btn pl-new-album-add"
+                onClick={() => {
+                  if (newFolderName.trim()) {
+                    createFolder(newFolderName);
+                    setNewFolderName("");
+                  }
+                  setNewFolderOpen(false);
+                }}
+              >
+                <Check size={13} />
+              </button>
+            </div>
+          )}
+          {folders.length === 0 && !newFolderOpen && (
+            <div className="pl-empty-hint">まだありません</div>
+          )}
+          {folders.map((f) => (
+            <div key={f.id} className="pl-nav-item-row">
+              <button
+                className={`pl-nav-item ${
+                  view.type === "folder" && view.value === f.name ? "active" : ""
+                }`}
+                onClick={() => setView({ type: "folder", value: f.name })}
+              >
+                <FolderOpen size={15} />
+                <span>{f.name}</span>
+                <em>{folderCounts.get(f.name) || 0}</em>
+              </button>
+              <button
+                className="pl-nav-item-del"
+                title="アルバムを削除"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirmDeleteFolder(f.name);
                 }}
               >
                 <Trash2 size={12} />
@@ -1141,7 +1394,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             <div className="pl-search">
               <Search size={15} />
               <input
-                placeholder="タイトル・タグ・アルバムで検索"
+                placeholder="タイトル・タグ・ギフトボード・アルバムで検索"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onFocus={(e) => e.target.select()}
@@ -1318,14 +1571,28 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
       {confirmDeleteAlbum && (
         <ConfirmDialog
-          title={`アルバム「${confirmDeleteAlbum}」を削除しますか？`}
-          message="アルバム自体が削除されます。写真は残り、未分類になります。"
+          title={`ギフトボード「${confirmDeleteAlbum}」を削除しますか？`}
+          message="ギフトボード自体が削除されます。写真は残り、未分類になります。"
           confirmLabel="削除する"
           onCancel={() => setConfirmDeleteAlbum(null)}
           onConfirm={() => {
             const a = confirmDeleteAlbum;
             setConfirmDeleteAlbum(null);
             deleteAlbum(a);
+          }}
+        />
+      )}
+
+      {confirmDeleteFolder && (
+        <ConfirmDialog
+          title={`アルバム「${confirmDeleteFolder}」を削除しますか？`}
+          message="アルバム自体が削除されます。写真は残り、未分類になります。"
+          confirmLabel="削除する"
+          onCancel={() => setConfirmDeleteFolder(null)}
+          onConfirm={() => {
+            const f = confirmDeleteFolder;
+            setConfirmDeleteFolder(null);
+            deleteFolder(f);
           }}
         />
       )}
@@ -1347,7 +1614,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       {confirmClearAll && (
         <ConfirmDialog
           title="すべてのデータを削除しますか？"
-          message="写真・タグ・アルバムなど、ライブラリの情報がすべて完全に削除されます。元に戻せません。"
+          message="写真・タグ・ギフトボード・アルバムなど、ライブラリの情報がすべて完全に削除されます。元に戻せません。"
           confirmLabel="すべて削除する"
           onCancel={() => setConfirmClearAll(false)}
           onConfirm={() => {
@@ -1463,10 +1730,10 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
               </div>
 
               <div className="pl-lb-field">
-                <span>アルバム(複数選択可・達成度はアルバムごと)</span>
+                <span>ギフトボード(複数選択可・達成度はギフトボードごと)</span>
                 {albums.length === 0 && (
                   <div className="pl-lb-no-albums">
-                    まだアルバムがありません。サイドバーの「+」から作成してください。
+                    まだギフトボードがありません。サイドバーの「+」から作成してください。
                   </div>
                 )}
                 <div className="pl-lb-album-list">
@@ -1540,6 +1807,36 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                 </div>
               </div>
 
+              <div className="pl-lb-field">
+                <span>アルバム(複数選択可)</span>
+                {folders.length === 0 && (
+                  <div className="pl-lb-no-albums">
+                    まだアルバムがありません。サイドバーの「+」から作成してください。
+                  </div>
+                )}
+                <div className="pl-lb-folder-list">
+                  {folders.map((f) => {
+                    const isMember = !!folderMembershipFor(lightboxPhoto.id, f.name);
+                    return (
+                      <label key={f.id} className="pl-lb-folder-check">
+                        <input
+                          type="checkbox"
+                          checked={isMember}
+                          onChange={(e) =>
+                            setPhotoFolderMembership(
+                              lightboxPhoto.id,
+                              f.id,
+                              e.target.checked
+                            )
+                          }
+                        />
+                        <span>{f.name}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
               <label className="pl-lb-field">
                 <span>タグ</span>
                 <TagEditor
@@ -1607,7 +1904,7 @@ function SettingsPanel({ settings, onChange, onReset, onClearAll, onClose, photo
               </span>
               <span className="pl-settings-menu-text">
                 <span>リセット</span>
-                <small>写真・タグ・アルバムを一括削除</small>
+                <small>写真・タグ・ギフトボード・アルバムを一括削除</small>
               </span>
               <ChevronRight size={16} className="pl-settings-menu-chevron" />
             </button>
@@ -1684,7 +1981,7 @@ function SettingsPanel({ settings, onChange, onReset, onClearAll, onClose, photo
               <div className="pl-settings-label">
                 <span>すべてのデータを削除</span>
                 <small>
-                  写真{photoCount}枚・アルバム・タグなど、ライブラリの情報を
+                  写真{photoCount}枚・ギフトボード・アルバム・タグなど、ライブラリの情報を
                   すべて完全に削除します。元に戻せません。
                 </small>
               </div>
@@ -3016,6 +3313,38 @@ const CSS = `
 }
 .pl-lb-progress-row.compact {
   padding-left: 23px;
+}
+
+.pl-lb-folder-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.pl-lb-folder-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 6px 12px 6px 10px;
+  cursor: pointer;
+}
+.pl-lb-folder-check input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+.pl-lb-folder-check span {
+  font-size: 12.5px;
+  color: var(--text);
+}
+.pl-lb-folder-check:has(input:checked) {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb),0.1);
 }
 
 .pl-tag-editor {
