@@ -25,6 +25,7 @@ import {
   RotateCcw,
   Sparkles,
   Menu,
+  GripVertical,
   Copy,
   LogOut,
 } from "lucide-react";
@@ -189,11 +190,15 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [query, setQuery] = useState("");
   const [lightboxId, setLightboxId] = useState(null);
   const [orderDraft, setOrderDraft] = useState("");
+  const [dragCardId, setDragCardId] = useState(null); // id of the photo currently being dragged
+  const [dragPreviewOrder, setDragPreviewOrder] = useState(null); // live-reordered id list while dragging
+  const dragMeta = useRef({ startX: 0, startY: 0, moved: false });
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [confirmDeleteAlbum, setConfirmDeleteAlbum] = useState(null); // album name or null
   const [confirmDeleteFolder, setConfirmDeleteFolder] = useState(null); // folder name or null
   const [confirmDeleteTag, setConfirmDeleteTag] = useState(null); // tag or null
   const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [confirmDeleteLibrary, setConfirmDeleteLibrary] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(null);
   const [pendingUploads, setPendingUploads] = useState(null); // staged items awaiting naming
@@ -966,6 +971,30 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     showToast("すべてのデータを削除しました");
   }
 
+  // Deletes the library itself — cascades (via foreign keys) remove its
+  // photos, albums, folders, memberships, and settings automatically.
+  // Storage files aren't linked by a DB foreign key, so clean those up first.
+  async function deleteLibrary() {
+    const paths = (photos || []).map((p) => p.path).filter(Boolean);
+    try {
+      if (paths.length) await supabase.storage.from("photos").remove(paths);
+      const { error } = await supabase.from("libraries").delete().eq("id", library.id);
+      if (error) {
+        console.error(error);
+        setSyncError(true);
+        showToast("ライブラリの削除に失敗しました");
+        return;
+      }
+    } catch (e) {
+      console.error(e);
+      setSyncError(true);
+      showToast("ライブラリの削除に失敗しました");
+      return;
+    }
+    showToast("ライブラリを削除しました");
+    onLeaveLibrary();
+  }
+
   const tagCounts = useMemo(() => {
     const m = new Map();
     (photos || []).forEach((p) =>
@@ -1076,6 +1105,69 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     }
     return list;
   }, [contextList, view, query, frameNumbers, memberships, folderMemberships]);
+
+  // Dragging to reorder is only safe when the displayed list exactly matches
+  // the context's own full order — i.e. no search narrowing it down, and not
+  // a favorites/tag view (those never map cleanly onto a single position
+  // scheme). "All photos"/album/folder views with no search query qualify.
+  const canDrag =
+    !query.trim() && (view.type === "all" || view.type === "album" || view.type === "folder");
+
+  const displayOrder = dragPreviewOrder
+    ? dragPreviewOrder.map((id) => filtered.find((p) => p.id === id)).filter(Boolean)
+    : filtered;
+
+  function handleCardPointerDown(e, photoId) {
+    if (!canDrag) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    dragMeta.current = { startX: e.clientX, startY: e.clientY, moved: false };
+    setDragCardId(photoId);
+    setDragPreviewOrder(filtered.map((p) => p.id));
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function handleCardPointerMove(e) {
+    if (!dragCardId) return;
+    const dx = e.clientX - dragMeta.current.startX;
+    const dy = e.clientY - dragMeta.current.startY;
+    if (!dragMeta.current.moved) {
+      if (Math.hypot(dx, dy) < 6) return;
+      dragMeta.current.moved = true;
+    }
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const cardEl = el && el.closest("[data-photo-id]");
+    const overId = cardEl && cardEl.getAttribute("data-photo-id");
+    if (!overId || overId === dragCardId) return;
+    setDragPreviewOrder((prev) => {
+      if (!prev) return prev;
+      const from = prev.indexOf(dragCardId);
+      const to = prev.indexOf(overId);
+      if (from === -1 || to === -1 || from === to) return prev;
+      const arr = [...prev];
+      arr.splice(from, 1);
+      arr.splice(to, 0, dragCardId);
+      return arr;
+    });
+  }
+
+  function handleCardPointerUp() {
+    if (!dragCardId) return;
+    const id = dragCardId;
+    const order = dragPreviewOrder;
+    setDragCardId(null);
+    setDragPreviewOrder(null);
+    if (dragMeta.current.moved && order) {
+      const newIndex = order.indexOf(id);
+      if (newIndex >= 0) reorderPhoto(id, newIndex + 1);
+    }
+    // dragMeta.current.moved is intentionally left as-is here — the
+    // following click event checks it to decide whether to open the
+    // lightbox, then clears it itself.
+  }
 
   // Achievement only applies inside a specific album view — "all photos"
   // and other views don't track/display it at all.
@@ -1582,7 +1674,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             </div>
           ) : (
             <div className="pl-grid">
-              {filtered.map((p, i) => {
+              {displayOrder.map((p, i) => {
                 const src = p.url;
                 const num = frameNumbers.get(p.id) || i + 1;
                 const inAlbumView = view.type === "album";
@@ -1591,8 +1683,17 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                 return (
                   <button
                     key={p.id}
-                    className={`pl-card ${achieved ? "achieved-glow" : ""}`}
-                    onClick={() => setLightboxId(p.id)}
+                    data-photo-id={p.id}
+                    className={`pl-card ${achieved ? "achieved-glow" : ""} ${
+                      dragCardId === p.id ? "dragging" : ""
+                    }`}
+                    onClick={() => {
+                      if (dragMeta.current.moved) {
+                        dragMeta.current.moved = false;
+                        return;
+                      }
+                      setLightboxId(p.id);
+                    }}
                   >
                     <div className="pl-card-img-wrap">
                       {src ? (
@@ -1600,6 +1701,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                           src={src}
                           alt={p.title}
                           loading="lazy"
+                          draggable={false}
                           className={inAlbumView && !achieved ? "pl-photo-mono" : ""}
                         />
                       ) : (
@@ -1607,11 +1709,27 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                           <Loader2 size={16} className="spin" />
                         </div>
                       )}
+                      {canDrag && (
+                        <span
+                          className="pl-card-drag-handle"
+                          onPointerDown={(e) => {
+                            e.stopPropagation();
+                            handleCardPointerDown(e, p.id);
+                          }}
+                          onPointerMove={handleCardPointerMove}
+                          onPointerUp={handleCardPointerUp}
+                          onPointerCancel={handleCardPointerUp}
+                        >
+                          <GripVertical size={13} />
+                        </span>
+                      )}
                     </div>
                     <div className="pl-card-frame">
-                      <span className="pl-card-num">
-                        {String(num).padStart(3, "0")}
-                      </span>
+                      {!inAlbumView && (
+                        <span className="pl-card-num">
+                          {String(num).padStart(3, "0")}
+                        </span>
+                      )}
                       <div className="pl-card-frame-line1">
                         <span className="pl-card-title">{p.title}</span>
                       </div>
@@ -1672,6 +1790,11 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             setSettingsOpen(false);
             setConfirmClearAll(true);
           }}
+          onDeleteLibrary={() => {
+            setSettingsOpen(false);
+            setConfirmDeleteLibrary(true);
+          }}
+          libraryName={library.name}
           photoCount={total}
           onClose={() => setSettingsOpen(false)}
         />
@@ -1747,6 +1870,19 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         />
       )}
 
+      {confirmDeleteLibrary && (
+        <ConfirmDialog
+          title={`ライブラリ「${library.name}」を削除しますか？`}
+          message="このライブラリ自体が削除され、参加している全員がアクセスできなくなります。写真・ギフトボード・アルバムなどすべての情報が完全に失われ、元に戻せません。"
+          confirmLabel="ライブラリを削除する"
+          onCancel={() => setConfirmDeleteLibrary(false)}
+          onConfirm={() => {
+            setConfirmDeleteLibrary(false);
+            deleteLibrary();
+          }}
+        />
+      )}
+
       {/* ---------- naming modal (staged uploads) ---------- */}
       {pendingUploads && (
         <NamingModal
@@ -1795,7 +1931,9 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                   );
                 })}
               </div>
-              <FrameBadge n={frameNumbers.get(lightboxPhoto.id) || lightboxIdx + 1} />
+              {view.type !== "album" && (
+                <FrameBadge n={frameNumbers.get(lightboxPhoto.id) || lightboxIdx + 1} />
+              )}
             </div>
 
             <div className="pl-lb-meta">
@@ -1981,7 +2119,16 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   );
 }
 
-function SettingsPanel({ settings, onChange, onReset, onClearAll, onClose, photoCount }) {
+function SettingsPanel({
+  settings,
+  onChange,
+  onReset,
+  onClearAll,
+  onDeleteLibrary,
+  libraryName,
+  onClose,
+  photoCount,
+}) {
   const [section, setSection] = useState(null); // null | 'appearance' | 'reset'
 
   const title =
@@ -2115,6 +2262,20 @@ function SettingsPanel({ settings, onChange, onReset, onClearAll, onClose, photo
                 onClick={onClearAll}
                 disabled={photoCount === 0}
               >
+                <Trash2 size={13} />
+                削除する
+              </button>
+            </div>
+
+            <div className="pl-settings-row pl-settings-row-divider">
+              <div className="pl-settings-label">
+                <span>ライブラリ「{libraryName}」を削除</span>
+                <small>
+                  このライブラリ自体を削除します。参加している全員がアクセスできなくなり、
+                  元に戻せません。
+                </small>
+              </div>
+              <button className="pl-settings-danger-btn" onClick={onDeleteLibrary}>
                 <Trash2 size={13} />
                 削除する
               </button>
@@ -2716,7 +2877,7 @@ const CSS = `
 
 .pl-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 18px;
 }
 .pl-card {
@@ -2773,6 +2934,30 @@ const CSS = `
   display: flex; align-items: center; justify-content: center;
   color: var(--text-muted);
 }
+.pl-card-drag-handle {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4,6,10,0.6);
+  color: var(--text-muted);
+  border-radius: 6px;
+  touch-action: none;
+  cursor: grab;
+  z-index: 2;
+}
+.pl-card-drag-handle:hover { color: var(--accent); }
+.pl-card.dragging {
+  opacity: 0.5;
+}
+.pl-card.dragging .pl-card-drag-handle {
+  cursor: grabbing;
+  color: var(--accent);
+}
 .frame-badge {
   position: absolute;
   left: 6px; bottom: 6px;
@@ -2788,7 +2973,7 @@ const CSS = `
 .pl-card-frame {
   position: relative;
   border-top: 1px solid var(--border);
-  padding: 8px 10px 7px;
+  padding: 8px 6px 7px;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -2797,7 +2982,7 @@ const CSS = `
 .pl-card-num {
   position: absolute;
   top: 8px;
-  left: 10px;
+  left: 6px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
   color: var(--accent);
@@ -2805,11 +2990,11 @@ const CSS = `
 .pl-card-frame-line1 {
   display: flex;
   justify-content: center;
-  padding: 0 24px;
+  padding: 0 3px;
   min-width: 0;
 }
 .pl-card-title {
-  font-size: 12.5px;
+  font-size: 11.5px;
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
@@ -2817,7 +3002,7 @@ const CSS = `
   min-width: 0;
   text-align: center;
 }
-.pl-card-frame-line2 { display: flex; justify-content: center; padding: 0 24px; }
+.pl-card-frame-line2 { display: flex; justify-content: center; padding: 0 3px; }
 .pl-card-progress-text {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
@@ -2897,6 +3082,11 @@ const CSS = `
   gap: 16px;
 }
 .pl-settings-row.column { flex-direction: column; align-items: stretch; gap: 8px; }
+.pl-settings-row-divider {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
 .pl-settings-label { display: flex; flex-direction: column; gap: 2px; }
 .pl-settings-label span { font-size: 13px; font-weight: 500; }
 .pl-settings-label small {
@@ -3561,8 +3751,8 @@ const CSS = `
   .pl-topbar-title-group { min-width: 0; }
 
   .pl-main { flex: 1 1 auto; min-height: 0; width: 100%; }
-  .pl-dropzone { min-height: 0; padding: 16px 14px 90px; }
-  .pl-grid { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .pl-dropzone { min-height: 0; padding: 16px 10px 90px; }
+  .pl-grid { grid-template-columns: repeat(3, 1fr); gap: 6px; }
 
   .pl-topbar {
     grid-template-columns: 1fr;
