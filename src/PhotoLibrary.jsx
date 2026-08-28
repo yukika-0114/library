@@ -2923,6 +2923,11 @@ const CSS = `
   text-align: left;
   color: var(--text);
   transition: box-shadow 0.6s ease, border-color 0.6s ease;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 .pl-card-img-wrap {
   position: relative;
@@ -2991,6 +2996,11 @@ const CSS = `
   flex-direction: column;
   gap: 4px;
   background: var(--surface);
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 .pl-card-frame-draggable { cursor: grab; }
 .pl-card.dragging .pl-card-frame-draggable { cursor: grabbing; }
