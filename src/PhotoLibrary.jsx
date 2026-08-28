@@ -25,7 +25,6 @@ import {
   RotateCcw,
   Sparkles,
   Menu,
-  GripVertical,
   Copy,
   LogOut,
 } from "lucide-react";
@@ -192,7 +191,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [orderDraft, setOrderDraft] = useState("");
   const [dragCardId, setDragCardId] = useState(null); // id of the photo currently being dragged
   const [dragPreviewOrder, setDragPreviewOrder] = useState(null); // live-reordered id list while dragging
-  const dragMeta = useRef({ startX: 0, startY: 0, moved: false });
+  const dragMeta = useRef({ startX: 0, startY: 0, moved: false, dragging: false });
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [confirmDeleteAlbum, setConfirmDeleteAlbum] = useState(null); // album name or null
   const [confirmDeleteFolder, setConfirmDeleteFolder] = useState(null); // folder name or null
@@ -1117,56 +1116,92 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     ? dragPreviewOrder.map((id) => filtered.find((p) => p.id === id)).filter(Boolean)
     : filtered;
 
-  function handleCardPointerDown(e, photoId) {
-    if (!canDrag) return;
-    if (e.pointerType === "mouse" && e.button !== 0) return;
-    dragMeta.current = { startX: e.clientX, startY: e.clientY, moved: false };
+  const longPressTimer = useRef(null);
+
+  function clearLongPress() {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }
+
+  function beginDrag(photoId) {
+    dragMeta.current.dragging = true;
+    dragMeta.current.moved = true; // suppress the click that follows release
     setDragCardId(photoId);
     setDragPreviewOrder(filtered.map((p) => p.id));
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
   }
 
-  function handleCardPointerMove(e) {
-    if (!dragCardId) return;
+  // Long-press (not an immediate drag) on the title/info block starts
+  // reordering — this avoids a fiddly small drag handle, and a normal tap
+  // or scroll gesture on that block is left alone unless it's held still.
+  function handleFramePointerDown(e, photoId) {
+    if (!canDrag) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const target = e.currentTarget;
+    const pointerId = e.pointerId;
+    dragMeta.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: false,
+      dragging: false,
+    };
+    clearLongPress();
+    longPressTimer.current = setTimeout(() => {
+      longPressTimer.current = null;
+      beginDrag(photoId);
+      try {
+        target.setPointerCapture(pointerId);
+      } catch {
+        /* ignore */
+      }
+    }, 420);
+  }
+
+  function handleFramePointerMove(e) {
+    if (dragMeta.current.dragging) {
+      e.preventDefault();
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const cardEl = el && el.closest("[data-photo-id]");
+      const overId = cardEl && cardEl.getAttribute("data-photo-id");
+      if (!overId || overId === dragCardId) return;
+      setDragPreviewOrder((prev) => {
+        if (!prev) return prev;
+        const from = prev.indexOf(dragCardId);
+        const to = prev.indexOf(overId);
+        if (from === -1 || to === -1 || from === to) return prev;
+        const arr = [...prev];
+        arr.splice(from, 1);
+        arr.splice(to, 0, dragCardId);
+        return arr;
+      });
+      return;
+    }
+    // Still waiting on the long-press timer — a real scroll/drag-away
+    // gesture should cancel it and behave like an ordinary tap/scroll.
+    if (!longPressTimer.current) return;
     const dx = e.clientX - dragMeta.current.startX;
     const dy = e.clientY - dragMeta.current.startY;
-    if (!dragMeta.current.moved) {
-      if (Math.hypot(dx, dy) < 6) return;
-      dragMeta.current.moved = true;
-    }
-    const el = document.elementFromPoint(e.clientX, e.clientY);
-    const cardEl = el && el.closest("[data-photo-id]");
-    const overId = cardEl && cardEl.getAttribute("data-photo-id");
-    if (!overId || overId === dragCardId) return;
-    setDragPreviewOrder((prev) => {
-      if (!prev) return prev;
-      const from = prev.indexOf(dragCardId);
-      const to = prev.indexOf(overId);
-      if (from === -1 || to === -1 || from === to) return prev;
-      const arr = [...prev];
-      arr.splice(from, 1);
-      arr.splice(to, 0, dragCardId);
-      return arr;
-    });
+    if (Math.hypot(dx, dy) > 10) clearLongPress();
   }
 
-  function handleCardPointerUp() {
+  function handleFramePointerUp() {
+    clearLongPress();
+    if (!dragMeta.current.dragging) return;
+    dragMeta.current.dragging = false;
     if (!dragCardId) return;
     const id = dragCardId;
     const order = dragPreviewOrder;
     setDragCardId(null);
     setDragPreviewOrder(null);
-    if (dragMeta.current.moved && order) {
+    if (order) {
       const newIndex = order.indexOf(id);
       if (newIndex >= 0) reorderPhoto(id, newIndex + 1);
     }
     // dragMeta.current.moved is intentionally left as-is here — the
-    // following click event checks it to decide whether to open the
-    // lightbox, then clears it itself.
+    // following click event (bubbling from the frame up to the card
+    // button) checks it to decide whether to open the lightbox, then
+    // clears it itself.
   }
 
   // Achievement only applies inside a specific album view — "all photos"
@@ -1709,28 +1744,24 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                           <Loader2 size={16} className="spin" />
                         </div>
                       )}
-                      {canDrag && (
-                        <span
-                          className="pl-card-drag-handle"
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            handleCardPointerDown(e, p.id);
-                          }}
-                          onPointerMove={handleCardPointerMove}
-                          onPointerUp={handleCardPointerUp}
-                          onPointerCancel={handleCardPointerUp}
-                        >
-                          <GripVertical size={13} />
-                        </span>
-                      )}
                     </div>
-                    <div className="pl-card-frame">
+                    <div
+                      className={`pl-card-frame ${canDrag ? "pl-card-frame-draggable" : ""}`}
+                      onPointerDown={(e) => {
+                        if (!canDrag) return;
+                        e.stopPropagation();
+                        handleFramePointerDown(e, p.id);
+                      }}
+                      onPointerMove={handleFramePointerMove}
+                      onPointerUp={handleFramePointerUp}
+                      onPointerCancel={handleFramePointerUp}
+                    >
                       {!inAlbumView && (
                         <span className="pl-card-num">
                           {String(num).padStart(3, "0")}
                         </span>
                       )}
-                      <div className="pl-card-frame-line1">
+                      <div className={`pl-card-frame-line1 ${!inAlbumView ? "with-num" : ""}`}>
                         <span className="pl-card-title">{p.title}</span>
                       </div>
                       {inAlbumView && membership && (
@@ -2934,29 +2965,11 @@ const CSS = `
   display: flex; align-items: center; justify-content: center;
   color: var(--text-muted);
 }
-.pl-card-drag-handle {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(4,6,10,0.6);
-  color: var(--text-muted);
-  border-radius: 6px;
-  touch-action: none;
-  cursor: grab;
-  z-index: 2;
-}
-.pl-card-drag-handle:hover { color: var(--accent); }
 .pl-card.dragging {
   opacity: 0.5;
 }
-.pl-card.dragging .pl-card-drag-handle {
-  cursor: grabbing;
-  color: var(--accent);
+.pl-card.dragging .pl-card-frame {
+  background: var(--surface-raised);
 }
 .frame-badge {
   position: absolute;
@@ -2973,26 +2986,30 @@ const CSS = `
 .pl-card-frame {
   position: relative;
   border-top: 1px solid var(--border);
-  padding: 8px 6px 7px;
+  padding: 4px 4px 7px;
   display: flex;
   flex-direction: column;
   gap: 4px;
   background: var(--surface);
 }
+.pl-card-frame-draggable { cursor: grab; }
+.pl-card.dragging .pl-card-frame-draggable { cursor: grabbing; }
 .pl-card-num {
   position: absolute;
-  top: 8px;
+  top: 6px;
   left: 6px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
+  line-height: 1;
   color: var(--accent);
 }
 .pl-card-frame-line1 {
   display: flex;
   justify-content: center;
-  padding: 0 3px;
+  padding: 0;
   min-width: 0;
 }
+.pl-card-frame-line1.with-num { margin-top: 15px; }
 .pl-card-title {
   font-size: 11.5px;
   font-weight: 500;
@@ -3002,7 +3019,7 @@ const CSS = `
   min-width: 0;
   text-align: center;
 }
-.pl-card-frame-line2 { display: flex; justify-content: center; padding: 0 3px; }
+.pl-card-frame-line2 { display: flex; justify-content: center; padding: 0; }
 .pl-card-progress-text {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
