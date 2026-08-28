@@ -126,10 +126,7 @@ function mapPhotoRow(row) {
     url: row.url,
     path: row.path,
     tags: row.tags || [],
-    album: row.album || "",
     favorite: !!row.favorite,
-    current: row.current || 0,
-    target: row.target || 0,
     position: row.position,
     createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
   };
@@ -154,7 +151,8 @@ function FrameBadge({ n }) {
 
 export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [photos, setPhotos] = useState(null); // null = loading
-  const [albums, setAlbums] = useState([]);
+  const [albums, setAlbums] = useState([]); // [{id, name}]
+  const [memberships, setMemberships] = useState(new Map()); // photoId -> [{albumId, albumName, current, target}]
   const [view, setView] = useState({ type: "all" }); // {type:'all'|'fav'|'album'|'tag', value}
 
   useEffect(() => {
@@ -238,7 +236,34 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       setSyncError(true);
     }
     setPhotos((photosRes.data || []).map(mapPhotoRow));
-    setAlbums((albumsRes.data || []).map((a) => a.name));
+    const albumRows = albumsRes.data || [];
+    setAlbums(albumRows.map((a) => ({ id: a.id, name: a.name })));
+
+    const albumIds = albumRows.map((a) => a.id);
+    const albumNameById = new Map(albumRows.map((a) => [a.id, a.name]));
+    const mMap = new Map();
+    if (albumIds.length) {
+      const { data: memRows, error: memErr } = await supabase
+        .from("photo_albums")
+        .select("photo_id, album_id, current, target")
+        .in("album_id", albumIds);
+      if (memErr) {
+        console.error(memErr);
+        setSyncError(true);
+      }
+      (memRows || []).forEach((row) => {
+        const entry = {
+          albumId: row.album_id,
+          albumName: albumNameById.get(row.album_id) || "",
+          current: row.current || 0,
+          target: row.target || 0,
+        };
+        if (!mMap.has(row.photo_id)) mMap.set(row.photo_id, []);
+        mMap.get(row.photo_id).push(entry);
+      });
+    }
+    setMemberships(mMap);
+
     if (settingsRes.data) {
       setSettings({
         accent: settingsRes.data.accent || DEFAULT_SETTINGS.accent,
@@ -263,6 +288,13 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "albums", filter: `library_id=eq.${library.id}` },
+        () => loadAll()
+      )
+      .on(
+        // photo_albums has no library_id column to filter by directly, so
+        // listen unfiltered and just refetch — fine at personal-library scale.
+        "postgres_changes",
+        { event: "*", schema: "public", table: "photo_albums" },
         () => loadAll()
       )
       .on(
@@ -327,8 +359,6 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
           dataUrl,
           blob,
           title: file.name.replace(/\.[^/.]+$/, ""),
-          current: 0,
-          target: 0,
         });
       } catch (e) {
         console.error(e);
@@ -381,15 +411,25 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
           url: pub.publicUrl,
           path,
           tags: [],
-          album: view.type === "album" ? view.value : "",
           favorite: false,
-          current: Math.max(0, Number(item.current) || 0),
-          target: Math.max(0, Number(item.target) || 0),
           position: basePosition + i + 1,
           created_by: session.user.id,
         };
         const { error: insErr } = await supabase.from("photos").insert(row);
         if (insErr) throw insErr;
+        // If adding while viewing a specific album, drop the new photo
+        // straight into that album (with fresh 0/0 progress).
+        if (view.type === "album") {
+          const albumId = albums.find((a) => a.name === view.value)?.id;
+          if (albumId) {
+            await supabase
+              .from("photo_albums")
+              .insert({ photo_id: id, album_id: albumId, current: 0, target: 0 })
+              .then(({ error }) => {
+                if (error) console.error(error);
+              });
+          }
+        }
         added.push(mapPhotoRow({ ...row, created_at: new Date().toISOString() }));
       } catch (e) {
         console.error(e);
@@ -406,6 +446,20 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
     if (added.length) {
       setPhotos((prev) => [...(prev || []), ...added]);
+      if (view.type === "album") {
+        const albumMatch = albums.find((a) => a.name === view.value);
+        if (albumMatch) {
+          setMemberships((prev) => {
+            const next = new Map(prev);
+            added.forEach((p) => {
+              next.set(p.id, [
+                { albumId: albumMatch.id, albumName: albumMatch.name, current: 0, target: 0 },
+              ]);
+            });
+            return next;
+          });
+        }
+      }
     }
 
     if (added.length && failedCount === 0) {
@@ -440,10 +494,82 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       (prev || []).map((p) => (p.id === id ? { ...p, ...patch } : p))
     );
     const dbPatch = {};
-    ["title", "tags", "album", "favorite", "current", "target"].forEach((k) => {
+    ["title", "tags", "favorite"].forEach((k) => {
       if (k in patch) dbPatch[k] = patch[k];
     });
     const { error } = await supabase.from("photos").update(dbPatch).eq("id", id);
+    if (error) {
+      console.error(error);
+      setSyncError(true);
+      showToast("保存に失敗しました");
+    }
+  }
+
+  // Add or remove a photo from an album. Achievement (current/target) lives
+  // on this membership, not on the photo — the same photo can have a
+  // different goal in each album it belongs to.
+  async function setPhotoAlbumMembership(photoId, albumId, isMember) {
+    setMemberships((prev) => {
+      const next = new Map(prev);
+      const list = next.get(photoId) ? [...next.get(photoId)] : [];
+      if (isMember) {
+        if (!list.some((m) => m.albumId === albumId)) {
+          const album = albums.find((a) => a.id === albumId);
+          list.push({
+            albumId,
+            albumName: album ? album.name : "",
+            current: 0,
+            target: 0,
+          });
+        }
+      } else {
+        const idx = list.findIndex((m) => m.albumId === albumId);
+        if (idx >= 0) list.splice(idx, 1);
+      }
+      next.set(photoId, list);
+      return next;
+    });
+
+    if (isMember) {
+      const { error } = await supabase
+        .from("photo_albums")
+        .upsert({ photo_id: photoId, album_id: albumId, current: 0, target: 0 });
+      if (error) {
+        console.error(error);
+        setSyncError(true);
+        showToast("保存に失敗しました");
+      }
+    } else {
+      const { error } = await supabase
+        .from("photo_albums")
+        .delete()
+        .eq("photo_id", photoId)
+        .eq("album_id", albumId);
+      if (error) {
+        console.error(error);
+        setSyncError(true);
+        showToast("保存に失敗しました");
+      }
+    }
+  }
+
+  async function updateMembershipProgress(photoId, albumId, patch) {
+    setMemberships((prev) => {
+      const next = new Map(prev);
+      const list = (next.get(photoId) || []).map((m) =>
+        m.albumId === albumId ? { ...m, ...patch } : m
+      );
+      next.set(photoId, list);
+      return next;
+    });
+    const dbPatch = {};
+    if ("current" in patch) dbPatch.current = patch.current;
+    if ("target" in patch) dbPatch.target = patch.target;
+    const { error } = await supabase
+      .from("photo_albums")
+      .update(dbPatch)
+      .eq("photo_id", photoId)
+      .eq("album_id", albumId);
     if (error) {
       console.error(error);
       setSyncError(true);
@@ -502,34 +628,41 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
 
   async function createAlbum(name) {
     const trimmed = name.trim();
-    if (!trimmed || albums.includes(trimmed)) return;
-    setAlbums((prev) => [...prev, trimmed]);
-    setView({ type: "album", value: trimmed });
-    const { error } = await supabase
+    if (!trimmed || albums.some((a) => a.name === trimmed)) return;
+    const { data, error } = await supabase
       .from("albums")
-      .insert({ library_id: library.id, name: trimmed });
+      .insert({ library_id: library.id, name: trimmed })
+      .select()
+      .single();
     if (error) {
       console.error(error);
       setSyncError(true);
       showToast("アルバムの保存に失敗しました");
+      return;
     }
+    setAlbums((prev) => [...prev, { id: data.id, name: data.name }]);
+    setView({ type: "album", value: trimmed });
   }
 
   async function deleteAlbum(name) {
-    setAlbums((prev) => prev.filter((a) => a !== name));
-    setPhotos((prev) =>
-      (prev || []).map((p) => (p.album === name ? { ...p, album: "" } : p))
-    );
+    const albumMatch = albums.find((a) => a.name === name);
+    setAlbums((prev) => prev.filter((a) => a.name !== name));
+    setMemberships((prev) => {
+      const next = new Map();
+      prev.forEach((list, photoId) => {
+        next.set(photoId, list.filter((m) => m.albumName !== name));
+      });
+      return next;
+    });
     if (view.type === "album" && view.value === name) setView({ type: "all" });
-    const [albumRes, photoRes] = await Promise.all([
-      supabase.from("albums").delete().eq("library_id", library.id).eq("name", name),
-      supabase
-        .from("photos")
-        .update({ album: "" })
-        .eq("library_id", library.id)
-        .eq("album", name),
-    ]);
-    if (albumRes.error || photoRes.error) setSyncError(true);
+    if (albumMatch) {
+      // Deleting the album row cascades to remove its photo_albums rows too.
+      const { error } = await supabase.from("albums").delete().eq("id", albumMatch.id);
+      if (error) {
+        console.error(error);
+        setSyncError(true);
+      }
+    }
     showToast(`アルバム「${name}」を削除しました`);
   }
 
@@ -564,6 +697,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     const paths = (photos || []).map((p) => p.path).filter(Boolean);
     setPhotos([]);
     setAlbums([]);
+    setMemberships(new Map());
     setView({ type: "all" });
     setQuery("");
     try {
@@ -586,12 +720,14 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   }, [photos]);
 
   const albumCounts = useMemo(() => {
-    const m = new Map(albums.map((a) => [a, 0]));
-    (photos || []).forEach((p) => {
-      if (p.album) m.set(p.album, (m.get(p.album) || 0) + 1);
+    const m = new Map(albums.map((a) => [a.name, 0]));
+    memberships.forEach((list) => {
+      list.forEach((entry) => {
+        m.set(entry.albumName, (m.get(entry.albumName) || 0) + 1);
+      });
     });
     return m;
-  }, [albums, photos]);
+  }, [albums, memberships]);
 
   const frameNumbers = useMemo(() => {
     const m = new Map();
@@ -599,10 +735,26 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
     return m;
   }, [photos]);
 
+  // Achievement (current/target) is per (photo, album) — meaningless outside
+  // an album context, so isAchieved needs to know which album to check.
+  function membershipFor(photoId, albumName) {
+    return (memberships.get(photoId) || []).find((m) => m.albumName === albumName);
+  }
+
+  function isAchieved(photoId, albumName) {
+    if (!albumName) return false;
+    const m = membershipFor(photoId, albumName);
+    return !!m && m.target > 0 && m.current >= m.target;
+  }
+
   const filtered = useMemo(() => {
     let list = photos || [];
     if (view.type === "fav") list = list.filter((p) => p.favorite);
-    if (view.type === "album") list = list.filter((p) => p.album === view.value);
+    if (view.type === "album") {
+      list = list.filter((p) =>
+        (memberships.get(p.id) || []).some((m) => m.albumName === view.value)
+      );
+    }
     if (view.type === "tag")
       list = list.filter((p) => (p.tags || []).includes(view.value));
     const qRaw = query.trim();
@@ -613,26 +765,26 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         const num = frameNumbers.get(p.id);
         const numStr = num != null ? String(num) : "";
         const numPadded = num != null ? String(num).padStart(3, "0") : "";
+        const albumNames = (memberships.get(p.id) || []).map((m) => m.albumName);
         return (
           p.title.toLowerCase().includes(q) ||
           (p.tags || []).some((t) => t.toLowerCase().includes(qTag)) ||
-          (p.album || "").toLowerCase().includes(q) ||
+          albumNames.some((n) => n.toLowerCase().includes(q)) ||
           numStr === qRaw ||
           numPadded.includes(qRaw)
         );
       });
     }
     return list;
-  }, [photos, view, query, frameNumbers]);
+  }, [photos, view, query, frameNumbers, memberships]);
 
-  function isAchieved(p) {
-    return (p.target || 0) > 0 && (p.current || 0) >= p.target;
-  }
-
-  const achievedCount = useMemo(
-    () => filtered.filter(isAchieved).length,
-    [filtered]
-  );
+  // Achievement only applies inside a specific album view — "all photos"
+  // and other views don't track/display it at all.
+  const achievedCount = useMemo(() => {
+    if (view.type !== "album") return 0;
+    return filtered.filter((p) => isAchieved(p.id, view.value)).length;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered, view, memberships]);
 
   const lightboxPhoto = filtered.find((p) => p.id === lightboxId) || null;
   const lightboxIdx = filtered.findIndex((p) => p.id === lightboxId);
@@ -864,23 +1016,23 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             <div className="pl-empty-hint">まだありません</div>
           )}
           {albums.map((a) => (
-            <div key={a} className="pl-nav-item-row">
+            <div key={a.id} className="pl-nav-item-row">
               <button
                 className={`pl-nav-item ${
-                  view.type === "album" && view.value === a ? "active" : ""
+                  view.type === "album" && view.value === a.name ? "active" : ""
                 }`}
-                onClick={() => setView({ type: "album", value: a })}
+                onClick={() => setView({ type: "album", value: a.name })}
               >
                 <FolderOpen size={15} />
-                <span>{a}</span>
-                <em>{albumCounts.get(a) || 0}</em>
+                <span>{a.name}</span>
+                <em>{albumCounts.get(a.name) || 0}</em>
               </button>
               <button
                 className="pl-nav-item-del"
                 title="アルバムを削除"
                 onClick={(e) => {
                   e.stopPropagation();
-                  setConfirmDeleteAlbum(a);
+                  setConfirmDeleteAlbum(a.name);
                 }}
               >
                 <Trash2 size={12} />
@@ -969,13 +1121,20 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
           </div>
 
           <div className="pl-topbar-center">
-            <span className="pl-count-ratio">
-              <span className="pl-count-label">達成</span>
-              <span className="pl-count-num achieved">{achievedCount}</span>
-              <span className="pl-count-slash">/</span>
-              <span className="pl-count-num total">{filtered.length}</span>
-              <span className="pl-count-label">枚</span>
-            </span>
+            {view.type === "album" ? (
+              <span className="pl-count-ratio">
+                <span className="pl-count-label">達成</span>
+                <span className="pl-count-num achieved">{achievedCount}</span>
+                <span className="pl-count-slash">/</span>
+                <span className="pl-count-num total">{filtered.length}</span>
+                <span className="pl-count-label">枚</span>
+              </span>
+            ) : (
+              <span className="pl-count-ratio">
+                <span className="pl-count-num total">{filtered.length}</span>
+                <span className="pl-count-label">枚</span>
+              </span>
+            )}
           </div>
 
           <div className="pl-topbar-right">
@@ -1050,10 +1209,13 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
               {filtered.map((p, i) => {
                 const src = p.url;
                 const num = frameNumbers.get(p.id) || i + 1;
+                const inAlbumView = view.type === "album";
+                const membership = inAlbumView ? membershipFor(p.id, view.value) : null;
+                const achieved = inAlbumView && isAchieved(p.id, view.value);
                 return (
                   <button
                     key={p.id}
-                    className={`pl-card ${isAchieved(p) ? "achieved-glow" : ""}`}
+                    className={`pl-card ${achieved ? "achieved-glow" : ""}`}
                     onClick={() => setLightboxId(p.id)}
                   >
                     <div className="pl-card-img-wrap">
@@ -1062,7 +1224,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                           src={src}
                           alt={p.title}
                           loading="lazy"
-                          className={isAchieved(p) ? "" : "pl-photo-mono"}
+                          className={inAlbumView && !achieved ? "pl-photo-mono" : ""}
                         />
                       ) : (
                         <div className="pl-card-loading">
@@ -1077,15 +1239,17 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                       <div className="pl-card-frame-line1">
                         <span className="pl-card-title">{p.title}</span>
                       </div>
-                      <div className="pl-card-frame-line2">
-                        <span
-                          className={`pl-card-progress-text ${
-                            isAchieved(p) ? "done" : ""
-                          }`}
-                        >
-                          {p.current || 0}/{p.target || 0}
-                        </span>
-                      </div>
+                      {inAlbumView && membership && (
+                        <div className="pl-card-frame-line2">
+                          <span
+                            className={`pl-card-progress-text ${
+                              achieved ? "done" : ""
+                            }`}
+                          >
+                            {membership.current}/{membership.target}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </button>
                 );
@@ -1211,7 +1375,9 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
             </button>
             <div
               className={`pl-lb-stage-wrap ${
-                isAchieved(lightboxPhoto) ? "achieved-glow" : ""
+                view.type === "album" && isAchieved(lightboxPhoto.id, view.value)
+                  ? "achieved-glow"
+                  : ""
               }`}
             >
               <div
@@ -1219,19 +1385,25 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                 ref={lbScrollRef}
                 onScroll={handleLbScroll}
               >
-                {filtered.map((p) => (
-                  <div className="pl-lb-imgstage-item" key={p.id}>
-                    {p.url ? (
-                      <img
-                        src={p.url}
-                        alt={p.title}
-                        className={isAchieved(p) ? "" : "pl-photo-mono"}
-                      />
-                    ) : (
-                      <Loader2 size={24} className="spin" />
-                    )}
-                  </div>
-                ))}
+                {filtered.map((p) => {
+                  const achievedHere =
+                    view.type === "album" && isAchieved(p.id, view.value);
+                  return (
+                    <div className="pl-lb-imgstage-item" key={p.id}>
+                      {p.url ? (
+                        <img
+                          src={p.url}
+                          alt={p.title}
+                          className={
+                            view.type === "album" && !achievedHere ? "pl-photo-mono" : ""
+                          }
+                        />
+                      ) : (
+                        <Loader2 size={24} className="spin" />
+                      )}
+                    </div>
+                  );
+                })}
               </div>
               <FrameBadge n={frameNumbers.get(lightboxPhoto.id) || lightboxIdx + 1} />
             </div>
@@ -1290,73 +1462,83 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
                 </div>
               </div>
 
-              <div className="pl-lb-field pl-lb-progress-field">
-                <span>目標の進捗</span>
-                <div className="pl-lb-progress-row">
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min="0"
-                    className="pl-lb-value-input"
-                    value={lightboxPhoto.current ?? 0}
-                    onFocus={(e) => e.target.select()}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") e.target.blur();
-                    }}
-                    onChange={(e) => {
-                      const v = e.target.value === "" ? 0 : Number(e.target.value);
-                      updatePhoto(lightboxPhoto.id, {
-                        current: Number.isFinite(v) ? Math.max(0, v) : 0,
-                      });
-                    }}
-                  />
-                  <span className="pl-lb-progress-slash">/</span>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min="0"
-                    className="pl-lb-value-input"
-                    value={lightboxPhoto.target ?? 0}
-                    onFocus={(e) => e.target.select()}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") e.target.blur();
-                    }}
-                    onChange={(e) => {
-                      const v = e.target.value === "" ? 0 : Number(e.target.value);
-                      updatePhoto(lightboxPhoto.id, {
-                        target: Number.isFinite(v) ? Math.max(0, v) : 0,
-                      });
-                    }}
-                  />
-                  {isAchieved(lightboxPhoto) && (
-                    <span className="pl-lb-achieved-badge">達成</span>
-                  )}
+              <div className="pl-lb-field">
+                <span>アルバム(複数選択可・達成度はアルバムごと)</span>
+                {albums.length === 0 && (
+                  <div className="pl-lb-no-albums">
+                    まだアルバムがありません。サイドバーの「+」から作成してください。
+                  </div>
+                )}
+                <div className="pl-lb-album-list">
+                  {albums.map((a) => {
+                    const m = membershipFor(lightboxPhoto.id, a.name);
+                    const isMember = !!m;
+                    const achieved = isMember && isAchieved(lightboxPhoto.id, a.name);
+                    return (
+                      <div key={a.id} className="pl-lb-album-row">
+                        <label className="pl-lb-album-check">
+                          <input
+                            type="checkbox"
+                            checked={isMember}
+                            onChange={(e) =>
+                              setPhotoAlbumMembership(
+                                lightboxPhoto.id,
+                                a.id,
+                                e.target.checked
+                              )
+                            }
+                          />
+                          <span>{a.name}</span>
+                        </label>
+                        {isMember && (
+                          <div className="pl-lb-progress-row compact">
+                            <input
+                              type="number"
+                              inputMode="numeric"
+                              min="0"
+                              className="pl-lb-value-input"
+                              value={m.current}
+                              onFocus={(e) => e.target.select()}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") e.target.blur();
+                              }}
+                              onChange={(e) => {
+                                const v =
+                                  e.target.value === "" ? 0 : Number(e.target.value);
+                                updateMembershipProgress(lightboxPhoto.id, a.id, {
+                                  current: Number.isFinite(v) ? Math.max(0, v) : 0,
+                                });
+                              }}
+                            />
+                            <span className="pl-lb-progress-slash">/</span>
+                            <input
+                              type="number"
+                              inputMode="numeric"
+                              min="0"
+                              className="pl-lb-value-input"
+                              value={m.target}
+                              onFocus={(e) => e.target.select()}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") e.target.blur();
+                              }}
+                              onChange={(e) => {
+                                const v =
+                                  e.target.value === "" ? 0 : Number(e.target.value);
+                                updateMembershipProgress(lightboxPhoto.id, a.id, {
+                                  target: Number.isFinite(v) ? Math.max(0, v) : 0,
+                                });
+                              }}
+                            />
+                            {achieved && (
+                              <span className="pl-lb-achieved-badge">達成</span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
-
-              <label className="pl-lb-field">
-                <span>アルバム</span>
-                <select
-                  value={lightboxPhoto.album || ""}
-                  onChange={(e) =>
-                    updatePhoto(lightboxPhoto.id, { album: e.target.value })
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      e.target.blur();
-                      setLightboxId(null);
-                    }
-                  }}
-                >
-                  <option value="">未分類</option>
-                  {albums.map((a) => (
-                    <option key={a} value={a}>
-                      {a}
-                    </option>
-                  ))}
-                </select>
-              </label>
 
               <label className="pl-lb-field">
                 <span>タグ</span>
@@ -1555,16 +1737,6 @@ function NamingModal({ items, onCancel, onConfirm }) {
   function setTitle(tempId, title) {
     setDrafts((ds) => ds.map((d) => (d.tempId === tempId ? { ...d, title } : d)));
   }
-  function setValue(tempId, key, raw) {
-    const v = raw === "" ? 0 : Number(raw);
-    setDrafts((ds) =>
-      ds.map((d) =>
-        d.tempId === tempId
-          ? { ...d, [key]: Number.isFinite(v) ? Math.max(0, v) : 0 }
-          : d
-      )
-    );
-  }
 
   return (
     <div className="pl-naming-overlay" onClick={onCancel}>
@@ -1583,7 +1755,7 @@ function NamingModal({ items, onCancel, onConfirm }) {
           {drafts.map((d, i) => (
             <div className="pl-naming-item" key={d.tempId}>
               <div className="pl-naming-thumb">
-                <img src={d.dataUrl} alt="" className="pl-photo-mono" />
+                <img src={d.dataUrl} alt="" />
                 <FrameBadge n={i + 1} />
               </div>
               <div className="pl-naming-fields">
@@ -1598,34 +1770,6 @@ function NamingModal({ items, onCancel, onConfirm }) {
                     if (e.key === "Enter") onConfirm(drafts);
                   }}
                 />
-                <div className="pl-naming-progress-row">
-                  <span className="pl-naming-progress-label">目標</span>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min="0"
-                    className="pl-naming-value-input"
-                    value={d.current}
-                    onFocus={(e) => e.target.select()}
-                    onChange={(e) => setValue(d.tempId, "current", e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") onConfirm(drafts);
-                    }}
-                  />
-                  <span className="pl-naming-progress-slash">/</span>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min="0"
-                    className="pl-naming-value-input"
-                    value={d.target}
-                    onFocus={(e) => e.target.select()}
-                    onChange={(e) => setValue(d.tempId, "target", e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") onConfirm(drafts);
-                    }}
-                  />
-                </div>
               </div>
             </div>
           ))}
@@ -2828,6 +2972,50 @@ const CSS = `
   letter-spacing: 0.05em;
   padding: 3px 8px;
   border-radius: 20px;
+}
+
+.pl-lb-no-albums {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--surface-raised);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 10px;
+}
+.pl-lb-album-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.pl-lb-album-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.pl-lb-album-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.pl-lb-album-check input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+.pl-lb-album-check span {
+  font-size: 13px;
+  color: var(--text);
+}
+.pl-lb-progress-row.compact {
+  padding-left: 23px;
 }
 
 .pl-tag-editor {
