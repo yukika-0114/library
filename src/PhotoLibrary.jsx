@@ -211,6 +211,7 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const fileInputRef = useRef(null);
   const lbScrollRef = useRef(null);
 
@@ -1332,7 +1333,11 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
       />
 
       {/* ---------- sidebar ---------- */}
-      <aside className={`pl-sidebar ${mobileNavOpen ? "mobile-open" : ""}`}>
+      <aside
+        className={`pl-sidebar ${mobileNavOpen ? "mobile-open" : ""} ${
+          sidebarCollapsed ? "collapsed" : ""
+        }`}
+      >
         <div className="pl-sidebar-head">
           <div className="pl-brand">
             <Film size={20} strokeWidth={1.75} />
@@ -1605,8 +1610,14 @@ export default function PhotoLibrary({ library, session, onLeaveLibrary }) {
         <header className="pl-topbar">
           <div className="pl-topbar-left">
             <button
-              className="pl-mobile-menu-btn"
-              onClick={() => setMobileNavOpen(true)}
+              className="pl-sidebar-toggle-btn"
+              onClick={() => {
+                if (window.matchMedia("(max-width: 760px)").matches) {
+                  setMobileNavOpen(true);
+                } else {
+                  setSidebarCollapsed((v) => !v);
+                }
+              }}
             >
               <Menu size={18} />
             </button>
@@ -2497,6 +2508,22 @@ const CSS = `
   gap: 22px;
   overflow-y: auto;
 }
+@media (min-width: 761px) {
+  .pl-sidebar.collapsed { display: none; }
+}
+.pl-sidebar-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+}
+.pl-sidebar-toggle-btn:hover { color: var(--accent); border-color: var(--accent); }
 .pl-brand {
   display: flex;
   align-items: center;
@@ -2776,7 +2803,8 @@ const CSS = `
   padding: 22px 28px;
   border-bottom: 1px solid var(--border);
 }
-.pl-topbar-left { min-width: 0; }
+.pl-topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.pl-topbar-title-group { min-width: 0; }
 .pl-topbar-left .pl-clear-filter { margin-top: 6px; }
 .pl-topbar-center { display: flex; justify-content: center; }
 .pl-topbar-right { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
@@ -3700,7 +3728,6 @@ const CSS = `
 }
 
 /* ---- mobile-only UI (hidden on desktop by default) ---- */
-.pl-mobile-menu-btn,
 .pl-mobile-close-btn,
 .pl-mobile-backdrop,
 .pl-mobile-fab {
@@ -3761,20 +3788,6 @@ const CSS = `
     color: var(--text-muted);
   }
   .pl-mobile-close-btn:hover { color: var(--accent); border-color: var(--accent); }
-
-  .pl-mobile-menu-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 34px;
-    height: 34px;
-    flex-shrink: 0;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--text);
-  }
-  .pl-topbar-left { display: flex; align-items: center; gap: 10px; }
   .pl-topbar-title-group { min-width: 0; }
 
   .pl-main { flex: 1 1 auto; min-height: 0; width: 100%; }
