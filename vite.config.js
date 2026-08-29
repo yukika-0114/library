@@ -7,7 +7,7 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: "autoUpdate",
-      includeAssets: ["favicon.svg", "icon-192.png", "icon-512.png"],
+      includeAssets: ["favicon.svg", "icon-192.png", "icon-512.png", "icon-512-maskable.png"],
       manifest: {
         name: "フィルムキャビネット",
         short_name: "フィルム",
@@ -28,7 +28,7 @@ export default defineConfig({
             type: "image/png",
           },
           {
-            src: "icon-512.png",
+            src: "icon-512-maskable.png",
             sizes: "512x512",
             type: "image/png",
             purpose: "maskable",
